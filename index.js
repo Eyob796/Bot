@@ -42,19 +42,34 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '')
 /* --------------------------- Memory --------------------------- */
 let redis = null;
 let usingRedis = false;
-if (process.env.REDIS_URL || process.env.UPSTASH_REDIS_REST_URL) {
-  try {
-    const url = process.env.REDIS_URL || process.env.UPSTASH_REDIS_REST_URL;
+
+try {
+  const url = process.env.REDIS_URL || process.env.UPSTASH_REDIS_REST_URL;
+  if (url) {
     redis = new Redis(url, {
-      password: process.env.UPSTASH_REDIS_REST_TOKEN || undefined
+      password: process.env.UPSTASH_REDIS_REST_TOKEN || undefined,
+      maxRetriesPerRequest: 1, // don’t retry forever / flood logs
     });
     usingRedis = true;
-    console.log('Using Redis memory.');
-  } catch (e) {
-    console.warn('Redis init failed:', e.message);
-    usingRedis = false;
+    console.log('🔗 Redis enabled, connecting...');
+
+    // If Redis errors at runtime, log once and switch to in-memory fallback
+    redis.on('error', (err) => {
+      console.error('⚠️ Redis error:', err.message || err);
+      console.log('👉 Falling back to in-memory mode.');
+      try { redis.disconnect(); } catch (_) {}
+      redis = null;
+      usingRedis = false;
+    });
+  } else {
+    console.log('ℹ️ No REDIS_URL found. Using memory mode.');
   }
+} catch (err) {
+  console.error('⚠️ Redis init failed:', err.message || err);
+  redis = null;
+  usingRedis = false;
 }
+
 const memCache = new NodeCache({ stdTTL: MEMORY_TTL, checkperiod: 120 });
 async function getMemory(chatId) {
   const key = `memory:${chatId}`;
@@ -63,7 +78,7 @@ async function getMemory(chatId) {
       const v = await redis.get(key);
       return v ? JSON.parse(v) : [];
     } catch (e) {
-      console.warn('Redis get failed:', e.message);
+      console.warn('Redis get failed:', e.message || e);
     }
   }
   return memCache.get(key) || [];
@@ -76,7 +91,7 @@ async function saveMemory(chatId, history) {
       await redis.set(key, JSON.stringify(history), 'EX', MEMORY_TTL);
       return;
     } catch (e) {
-      console.warn('Redis set failed:', e.message);
+      console.warn('Redis set failed:', e.message || e);
     }
   }
   memCache.set(key, history);
@@ -88,7 +103,7 @@ async function clearMemory(chatId) {
       await redis.del(key);
       return;
     } catch (e) {
-      console.warn('Redis del failed:', e.message);
+      console.warn('Redis del failed:', e.message || e);
     }
   }
   memCache.del(key);
@@ -622,5 +637,15 @@ bot.command('ai', async (ctx) => {
 })();
 
 // Enable graceful stop
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGINT', async () => {
+  if (redis) {
+    try { await redis.quit(); } catch (_) {}
+  }
+  bot.stop('SIGINT');
+});
+process.once('SIGTERM', async () => {
+  if (redis) {
+    try { await redis.quit(); } catch (_) {}
+  }
+  bot.stop('SIGTERM');
+});
